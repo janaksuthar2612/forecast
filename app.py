@@ -1,5 +1,5 @@
-# File name: sales_forecast_app.py
-# Run with:   streamlit run sales_forecast_app.py
+# Updated sales_forecast_app with enhanced Human-AI interaction features
+# Run with: streamlit run sales_forecast_app.py
 
 import streamlit as st
 import pandas as pd
@@ -11,6 +11,9 @@ import plotly.express as px
 import plotly.graph_objects as go
 from datetime import datetime
 import json
+import os
+import pickle
+import time
 
 # Attempt to import shap (optional). Explainability will fall back to feature_importances_ if not available.
 try:
@@ -215,6 +218,39 @@ def compute_feature_importance(model, feature_names, X_sample=None):
         return fi_df
 
 
+# Utility: append a small log row to CSV (creates file if not exists)
+def append_log_row(filename, row: dict):
+    df = pd.DataFrame([row])
+    if os.path.exists(filename):
+        try:
+            df_existing = pd.read_csv(filename)
+            df_to_write = pd.concat([df_existing, df], ignore_index=True)
+            df_to_write.to_csv(filename, index=False)
+        except Exception:
+            # fallback to append mode
+            df.to_csv(filename, mode='a', header=not os.path.exists(filename), index=False)
+    else:
+        df.to_csv(filename, index=False)
+
+
+# LLM placeholder summary generator (replace with actual LLM call)
+def generate_llm_summary(report: dict) -> str:
+    """
+    Placeholder: produce a short templated summary for escalation or review.
+    To integrate a real LLM, replace the body with an API call (OpenAI, etc.)
+    and pass 'report' as context / system prompt.
+    """
+    s = []
+    s.append(f"Brand: {report['data_provenance'].get('brand')}")
+    s.append(f"Training data: {report['data_provenance'].get('training_start')} to {report['data_provenance'].get('training_end')} ({report['data_provenance'].get('history_months')} months)")
+    s.append(f"Sales RMSE (train): {report['training_metrics'].get('sales_rmse')}")
+    s.append(f"Returns RMSE (train): {report['training_metrics'].get('returns_rmse')}")
+    s.append("Top sales features: " + ", ".join([f['feature'] for f in report.get('feature_importance_sales', [])[:3]]))
+    s.append("Top returns features: " + ", ".join([f['feature'] for f in report.get('feature_importance_returns', [])[:3]]))
+    s.append("\nSuggested action: Please review forecasts and safety buffer overrides; consider holding manual stock for high-risk SKUs.")
+    return "\n".join(s)
+
+
 # ────────────────────────────────────────────────────────────────
 # 6. Main App
 # ────────────────────────────────────────────────────────────────
@@ -222,7 +258,7 @@ def main():
     st.set_page_config(page_title="Sales & Returns AI Forecaster", layout="wide")
 
     st.title("📊 AI Sales Forecasting & Return Reduction Dashboard")
-    st.markdown("**Current date:** December 31, 2025 | Using XGBoost + Shelf-life feature")
+    st.markdown(f"**Current date:** {datetime.now().date()} | Using XGBoost + Shelf-life feature")
 
     # File uploader
     uploaded_file = st.sidebar.file_uploader("Upload your sales Excel file", type=["xlsx"])
@@ -251,6 +287,23 @@ def main():
         help="Override default buffer (default computed from shelf life). Use to simulate more/less conservative stocking."
     )
     show_explain = st.sidebar.checkbox("Show Explainability & Human-AI notes", value=True)
+
+    # New: qualitative event / uplift override (e.g., holiday, promotion)
+    st.sidebar.header("Qualitative overrides & Simulations")
+    event_note = st.sidebar.text_input("Optional event note (e.g., 'Eid promotion')", value="")
+    uplift_percent = st.sidebar.number_input("Event uplift on sales (%)", min_value=-100.0, max_value=500.0, value=0.0, step=0.5)
+    uplift_months = st.sidebar.slider("Uplift months (apply to next N months)", min_value=0, max_value=12, value=0)
+
+    # Simulation: returns spike
+    returns_spike_pct = st.sidebar.slider("Simulate returns spike (%)", -100, 500, 0, step=5, help="Apply a simulated % change to forecasted returns to see impact.")
+
+    # Escalation threshold
+    st.sidebar.header("Automation Controls")
+    rmse_escalation_threshold = st.sidebar.number_input("Escalation RMSE threshold (sales)", min_value=0.0, value=1.0, step=0.1)
+    auto_approve_low_risk = st.sidebar.checkbox("Auto-approve low-risk recommendations (RMSE below threshold)", value=False)
+
+    # Feedback log user identity (prefill from current user)
+    current_user = st.sidebar.text_input("User (for logs)", value="janaksuthar2612")
 
     # Filter data for selected brand
     product_data = monthly[monthly['brand'] == selected_brand].copy()
@@ -287,69 +340,99 @@ def main():
         train_rmse_returns = None
 
     # ── Forecasting ─────────────────────────────────────────────────
-    current_row = product_data.iloc[-1].copy()
-    forecast_dates = []
-    sales_forecast = []
-    returns_forecast = []
-    recommended_stock = []
+    def run_forecast(models_tuple, apply_uplift=True, returns_spike=0.0):
+        model_sales, features_sales = models_tuple['sales']
+        model_returns, features_returns = models_tuple['returns']
+        current_row = product_data.iloc[-1].copy()
+        forecast_dates = []
+        sales_forecast = []
+        returns_forecast = []
+        recommended_stock = []
+        working_row = current_row.copy()
 
-    # Working copy of lags inside loop for multi-step forecasting
-    working_row = current_row.copy()
+        for i in range(forecast_months):
+            next_date = working_row['date'] + pd.DateOffset(months=1)
+            forecast_dates.append(next_date)
+            month_num = next_date.month
 
-    for i in range(forecast_months):
-        next_date = working_row['date'] + pd.DateOffset(months=1)
-        forecast_dates.append(next_date)
+            # prepare features
+            X_next_sales = pd.DataFrame([{
+                'month_num': month_num,
+                'shelf_life_days': working_row['shelf_life_days'],
+                **{f'lag_{j}_sales': working_row.get(f'lag_{j}_sales', 0) for j in range(1, lag_count+1)},
+                **{f'lag_{j}_returns': working_row.get(f'lag_{j}_returns', 0) for j in range(1, lag_count+1)}
+            }])
 
-        month_num = next_date.month
+            if features_sales:
+                for col in features_sales:
+                    if col not in X_next_sales.columns:
+                        X_next_sales[col] = 0
+                X_next_sales = X_next_sales[features_sales]
 
-        # Prepare features for next month
-        X_next_sales = pd.DataFrame([{
-            'month_num': month_num,
-            'shelf_life_days': working_row['shelf_life_days'],
-            **{f'lag_{j}_sales': working_row.get(f'lag_{j}_sales', 0) for j in range(1, lag_count+1)},
-            **{f'lag_{j}_returns': working_row.get(f'lag_{j}_returns', 0) for j in range(1, lag_count+1)}
-        }])
+            pred_sales = max(0, model_sales.predict(X_next_sales)[0])
 
-        # Ensure columns match training feature order to avoid XGBoost feature_names mismatch
-        if features_sales:
-            # add any missing columns with 0
-            for col in features_sales:
-                if col not in X_next_sales.columns:
-                    X_next_sales[col] = 0
-            # reorder to the exact order used at training
-            X_next_sales = X_next_sales[features_sales]
+            # apply qualitative uplift for the first uplift_months if requested
+            if apply_uplift and uplift_months > 0 and i < uplift_months and uplift_percent != 0:
+                pred_sales = pred_sales * (1.0 + uplift_percent / 100.0)
 
-        pred_sales = max(0, model_sales.predict(X_next_sales)[0])
-        sales_forecast.append(pred_sales)
+            sales_forecast.append(pred_sales)
 
-        # Use predicted sales as feature for returns
-        X_next_returns = X_next_sales.copy()
-        if features_returns and 'lag_1_sales' in features_returns:
-            X_next_returns['lag_1_sales'] = pred_sales
+            # returns prediction (use predicted sales as needed)
+            X_next_returns = X_next_sales.copy()
+            if features_returns and 'lag_1_sales' in features_returns:
+                X_next_returns['lag_1_sales'] = pred_sales
+            if features_returns:
+                for col in features_returns:
+                    if col not in X_next_returns.columns:
+                        X_next_returns[col] = 0
+                X_next_returns = X_next_returns[features_returns]
 
-        if features_returns:
-            for col in features_returns:
-                if col not in X_next_returns.columns:
-                    X_next_returns[col] = 0
-            X_next_returns = X_next_returns[features_returns]
+            pred_returns = max(0, model_returns.predict(X_next_returns)[0])
 
-        pred_returns = max(0, model_returns.predict(X_next_returns)[0])
-        returns_forecast.append(pred_returns)
+            # apply simulated returns spike
+            if returns_spike != 0:
+                pred_returns = pred_returns * (1.0 + returns_spike / 100.0)
 
-        # Simple safety stock logic (use human override multiplier when provided)
-        default_buffer = 1.15 if working_row['shelf_life_days'] <= 14 else 1.05
-        buffer = human_buffer_override if human_buffer_override is not None else default_buffer
-        stock = pred_sales - pred_returns * buffer
-        recommended_stock.append(max(0, stock))
+            returns_forecast.append(pred_returns)
 
-        # Update working_row lags for next iteration
-        # shift sales lags down and insert pred_sales as lag_1
-        for lag in range(lag_count, 1, -1):
-            working_row[f'lag_{lag}_sales'] = working_row.get(f'lag_{lag-1}_sales', 0)
-            working_row[f'lag_{lag}_returns'] = working_row.get(f'lag_{lag-1}_returns', 0)
-        working_row['lag_1_sales'] = pred_sales
-        working_row['lag_1_returns'] = pred_returns
-        working_row['date'] = next_date
+            default_buffer = 1.15 if working_row['shelf_life_days'] <= 14 else 1.05
+            buffer = human_buffer_override if human_buffer_override is not None else default_buffer
+            stock = pred_sales - pred_returns * buffer
+            recommended_stock.append(max(0, stock))
+
+            # update lags
+            for lag in range(lag_count, 1, -1):
+                working_row[f'lag_{lag}_sales'] = working_row.get(f'lag_{lag-1}_sales', 0)
+                working_row[f'lag_{lag}_returns'] = working_row.get(f'lag_{lag-1}_returns', 0)
+            working_row['lag_1_sales'] = pred_sales
+            working_row['lag_1_returns'] = pred_returns
+            working_row['date'] = next_date
+
+        df = pd.DataFrame({
+            'Date': forecast_dates,
+            'Forecast Sales': np.array(sales_forecast),
+            'Forecast Returns': np.array(returns_forecast),
+            'Recommended Stock': np.array(recommended_stock)
+        })
+        return df
+
+    models_tuple = {
+        'sales': (model_sales, features_sales),
+        'returns': (model_returns, features_returns)
+    }
+
+    df_forecast = run_forecast(models_tuple, apply_uplift=True, returns_spike=0.0)
+
+    # Also compute a simulated forecast for returns spike to show delta
+    if returns_spike_pct != 0:
+        df_sim = run_forecast(models_tuple, apply_uplift=True, returns_spike=returns_spike_pct)
+        df_compare = df_forecast.copy()
+        df_compare['Sim Recommended Stock'] = df_sim['Recommended Stock']
+        df_compare['Delta Stock'] = df_compare['Sim Recommended Stock'] - df_compare['Recommended Stock']
+    else:
+        df_compare = df_forecast.copy()
+        df_compare['Sim Recommended Stock'] = df_forecast['Recommended Stock']
+        df_compare['Delta Stock'] = 0.0
 
     # ── Results Visualization ───────────────────────────────────────
     st.subheader(f"Forecast for **{selected_brand}** ({forecast_months} months)")
@@ -365,8 +448,8 @@ def main():
             name='Historical Sales'
         ))
         fig_sales.add_trace(go.Scatter(
-            x=forecast_dates,
-            y=sales_forecast,
+            x=df_forecast['Date'],
+            y=df_forecast['Forecast Sales'],
             mode='lines+markers',
             name='Forecast Sales',
             line=dict(dash='dash', color='orange')
@@ -383,8 +466,8 @@ def main():
             name='Historical Returns'
         ))
         fig_returns.add_trace(go.Scatter(
-            x=forecast_dates,
-            y=returns_forecast,
+            x=df_forecast['Date'],
+            y=df_forecast['Forecast Returns'],
             mode='lines+markers',
             name='Forecast Returns',
             line=dict(dash='dash', color='red')
@@ -392,27 +475,106 @@ def main():
         fig_returns.update_layout(title="Returns", xaxis_title="Date", yaxis_title="Value")
         st.plotly_chart(fig_returns, use_container_width=True)
 
-    # Recommendation
+    # Recommendation + interactive approval
     st.subheader("Inventory Recommendation")
-    df_forecast = pd.DataFrame({
-        'Date': forecast_dates,
-        'Forecast Sales': np.round(sales_forecast, 0),
-        'Forecast Returns': np.round(returns_forecast, 0),
-        'Recommended Stock': np.round(recommended_stock, 0)
-    })
+    display_df = df_compare.copy()
+    display_df_display = display_df.copy()
+    display_df_display['Forecast Sales'] = display_df_display['Forecast Sales'].round(0).astype(int)
+    display_df_display['Forecast Returns'] = display_df_display['Forecast Returns'].round(0).astype(int)
+    display_df_display['Recommended Stock'] = display_df_display['Recommended Stock'].round(0).astype(int)
+    display_df_display['Sim Recommended Stock'] = display_df_display['Sim Recommended Stock'].round(0).astype(int)
+    display_df_display['Delta Stock'] = display_df_display['Delta Stock'].round(0).astype(int)
 
-    st.dataframe(df_forecast.style.format({
-        'Forecast Sales': '{:,.0f}',
-        'Forecast Returns': '{:,.0f}',
-        'Recommended Stock': '{:,.0f}'
-    }), use_container_width=True)
+    st.dataframe(display_df_display, use_container_width=True)
 
-    total_reduction = np.sum(recommended_stock) - np.sum(sales_forecast)
+    total_reduction = np.sum(display_df['Recommended Stock']) - np.sum(display_df['Forecast Sales'])
     st.metric(
         "Estimated Return Reduction (value)",
         f"{total_reduction:,.0f}",
         delta_color="normal" if total_reduction < 0 else "inverse"
     )
+
+    # Auto-approve logic for low-risk
+    auto_approved = False
+    if auto_approve_low_risk and train_rmse_sales is not None and train_rmse_sales < rmse_escalation_threshold:
+        auto_approved = True
+
+    st.markdown("### Human Approval")
+    if auto_approved:
+        st.success("Auto-approved: model RMSE is below the escalation threshold.")
+    else:
+        col_approve, col_reject = st.columns(2)
+        with col_approve:
+            if st.button("✅ Approve recommendation"):
+                row = {
+                    "timestamp": datetime.now().isoformat(),
+                    "user": current_user,
+                    "brand": selected_brand,
+                    "action": "approve",
+                    "event_note": event_note,
+                    "uplift_percent": uplift_percent,
+                    "uplift_months": uplift_months,
+                    "returns_spike_pct": returns_spike_pct,
+                    "forecast_months": forecast_months,
+                    "train_rmse_sales": train_rmse_sales,
+                    "train_rmse_returns": train_rmse_returns
+                }
+                append_log_row("decisions_log.csv", row)
+                st.success("Decision logged: Approved.")
+
+        with col_reject:
+            if st.button("❌ Reject recommendation"):
+                row = {
+                    "timestamp": datetime.now().isoformat(),
+                    "user": current_user,
+                    "brand": selected_brand,
+                    "action": "reject",
+                    "event_note": event_note,
+                    "uplift_percent": uplift_percent,
+                    "uplift_months": uplift_months,
+                    "returns_spike_pct": returns_spike_pct,
+                    "forecast_months": forecast_months,
+                    "train_rmse_sales": train_rmse_sales,
+                    "train_rmse_returns": train_rmse_returns
+                }
+                append_log_row("decisions_log.csv", row)
+                st.warning("Decision logged: Rejected.")
+
+    # Escalation panel
+    if train_rmse_sales is not None and train_rmse_sales > rmse_escalation_threshold:
+        st.error(f"High model uncertainty: Sales train RMSE = {train_rmse_sales:.2f} (>{rmse_escalation_threshold}). Consider escalation.")
+        if st.button("Request escalation / human review"):
+            report = {
+                "data_provenance": {
+                    "brand": selected_brand,
+                    "history_months": int(len(product_data)),
+                    "training_start": str(product_data['date'].min().date()),
+                    "training_end": str(product_data['date'].max().date()),
+                    "rows_used_for_training_sales": int(X_sales.shape[0]) if X_sales is not None else 0,
+                    "rows_used_for_training_returns": int(X_returns.shape[0]) if X_returns is not None else 0,
+                    "model_algorithm": "XGBoostRegressor",
+                    "model_params_sales": model_sales.get_params() if model_sales else {},
+                    "model_params_returns": model_returns.get_params() if model_returns else {},
+                    "shap_available": SHAP_AVAILABLE
+                },
+                "training_metrics": {
+                    "sales_rmse": float(train_rmse_sales) if train_rmse_sales is not None else None,
+                    "returns_rmse": float(train_rmse_returns) if train_rmse_returns is not None else None
+                },
+                "feature_importance_sales": compute_feature_importance(model_sales, features_sales, X_sample=X_sales.head(200)).to_dict(orient='records'),
+                "feature_importance_returns": compute_feature_importance(model_returns, features_returns, X_sample=X_returns.head(200)).to_dict(orient='records'),
+            }
+            summary = generate_llm_summary(report)
+            append_log_row("escalations_log.csv", {
+                "timestamp": datetime.now().isoformat(),
+                "user": current_user,
+                "brand": selected_brand,
+                "train_rmse_sales": train_rmse_sales,
+                "reason": "rmse_above_threshold",
+                "llm_summary": summary
+            })
+            st.info("Escalation requested and logged. Summary:")
+            st.code(summary)
 
     # ── Explainability & Human-AI Interaction Panel ─────────────────
     if show_explain:
@@ -494,6 +656,77 @@ def main():
         report_text = json.dumps(report, indent=2)
         st.download_button("📥 Download Explainability JSON", report_text, file_name=f"{selected_brand}_explainability_{datetime.now().strftime('%Y%m%d')}.json", mime="application/json")
 
+    # ── Feedback Loop: upload actuals & rate the explanation ───────────
+    st.header("Post-decision feedback & retraining")
+    st.markdown("Upload actuals (Date, Actual Sales, Actual Returns) to record outcomes and compute error vs forecast.")
+    actuals_file = st.file_uploader("Upload actuals CSV", type=["csv"], key="actuals_uploader")
+
+    if actuals_file is not None:
+        try:
+            actuals = pd.read_csv(actuals_file, parse_dates=['Date'])
+            # merge with forecast on Date
+            merged = pd.merge(df_forecast, actuals, on='Date', how='inner')
+            if merged.empty:
+                st.warning("No matching dates between forecast and uploaded actuals.")
+            else:
+                merged['sales_error'] = merged['Actual Sales'] - merged['Forecast Sales']
+                merged['returns_error'] = merged['Actual Returns'] - merged['Forecast Returns']
+                merged_summary = {
+                    "timestamp": datetime.now().isoformat(),
+                    "user": current_user,
+                    "brand": selected_brand,
+                    "rows": len(merged),
+                    "mean_sales_error": float(merged['sales_error'].mean()),
+                    "mean_returns_error": float(merged['returns_error'].mean())
+                }
+                append_log_row("feedback_log.csv", merged_summary)
+                st.success("Actuals processed and feedback logged.")
+                st.dataframe(merged.assign(sales_error=lambda d: d['sales_error'].round(2), returns_error=lambda d: d['returns_error'].round(2)))
+        except Exception as e:
+            st.error(f"Error processing actuals: {e}")
+
+    st.markdown("Rate the explanation & decision (1 = poor, 5 = excellent)")
+    rating = st.slider("Explanation clarity rating", 1, 5, 4, step=1)
+    comments = st.text_area("Optional comments (what was helpful / unclear?)")
+
+    if st.button("Submit feedback"):
+        feedback_row = {
+            "timestamp": datetime.now().isoformat(),
+            "user": current_user,
+            "brand": selected_brand,
+            "rating": int(rating),
+            "comments": comments,
+            "event_note": event_note,
+            "uplift_percent": uplift_percent,
+            "uplift_months": uplift_months,
+            "returns_spike_pct": returns_spike_pct
+        }
+        append_log_row("feedback_log.csv", feedback_row)
+        st.success("Thanks — feedback recorded. This will be used for retraining / continuous improvement.")
+
+    # Retrain button (in-session)
+    if st.button("Retrain models now"):
+        with st.spinner("Retraining models..."):
+            model_sales_new, features_sales_new, X_sales_new, y_sales_new = train_xgboost_brand(product_data, 'sales')
+            model_returns_new, features_returns_new, X_returns_new, y_returns_new = train_xgboost_brand(product_data, 'returns')
+            if model_sales_new is not None and model_returns_new is not None:
+                # overwrite models used for forecasting in-session
+                model_sales = model_sales_new
+                model_returns = model_returns_new
+                features_sales = features_sales_new
+                features_returns = features_returns_new
+                X_sales = X_sales_new
+                X_returns = X_returns_new
+                train_pred_sales = model_sales.predict(X_sales)
+                train_rmse_sales = mean_squared_error(y_sales, train_pred_sales, squared=False)
+                train_pred_returns = model_returns.predict(X_returns)
+                train_rmse_returns = mean_squared_error(y_returns, train_pred_returns, squared=False)
+                # recompute forecast
+                df_forecast = run_forecast({'sales': (model_sales, features_sales), 'returns': (model_returns, features_returns)}, apply_uplift=True, returns_spike=returns_spike_pct)
+                st.success("Retraining complete and forecasts updated.")
+            else:
+                st.error("Retraining failed due to insufficient data or other error.")
+
     # Download forecast CSV
     csv = df_forecast.to_csv(index=False).encode('utf-8')
     st.download_button(
@@ -503,6 +736,25 @@ def main():
         "text/csv"
     )
 
+    # Provide quick onboarding & tutorials
+    with st.expander("How shelf_life_days affects returns (brief tutorial)"):
+        st.markdown("""
+        - shelf_life_days is included as a feature in the model: shorter shelf life often increases returns (waste) risk and may reduce recommended stock safety.
+        - The safety buffer uses shelf-life to be more conservative for perishable items.
+        - Try changing the buffer multiplier in the sidebar to see how recommended stock responds.
+        - Use the 'Event uplift' to simulate promotions/holidays that temporarily increase demand.
+        """)
+
+    with st.expander("How to connect an LLM for summaries and escalation"):
+        st.markdown("""
+        - We provide a templated summary using `generate_llm_summary()` as a placeholder.
+        - Replace that function body with a call to your LLM provider (OpenAI, Anthropic, etc.), passing the 'report' JSON as context.
+        - Example (pseudo):
+          1) load API key from secret store
+          2) call openai.ChatCompletion.create(system=..., user=report_text)
+          3) return text
+        - For sensitive data, ensure encryption in transit & logs, and limit PII in prompts.
+        """)
 
 if __name__ == "__main__":
     main()
