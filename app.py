@@ -1,5 +1,5 @@
-# Updated sales_forecast_app with enhanced Human-AI interaction features
-# Run with: streamlit run sales_forecast_app.py
+# Updated sales_forecast_app with Groq/LLM explainability & automation integration
+# Run with: streamlit run app.py
 
 import streamlit as st
 import pandas as pd
@@ -14,6 +14,7 @@ import json
 import os
 import pickle
 import time
+import requests  # used for LLM/Groq HTTP calls
 
 # Attempt to import shap (optional). Explainability will fall back to feature_importances_ if not available.
 try:
@@ -23,7 +24,7 @@ except Exception:
     SHAP_AVAILABLE = False
 
 # ────────────────────────────────────────────────────────────────
-# 1. Shelf-life mapping (days) - typical values for dairy/juice products
+# 1. Shelf-life mapping (days)
 # ────────────────────────────────────────────────────────────────
 SHELF_LIFE_MAP = {
     'Actimel': 28,
@@ -58,7 +59,7 @@ SHELF_LIFE_MAP = {
 }
 
 # ────────────────────────────────────────────────────────────────
-# 2. Column renaming mapping (very important!)
+# 2. Column renaming mapping
 # ────────────────────────────────────────────────────────────────
 COLUMN_MAPPING = {
     'Channel Name': 'channel',
@@ -147,7 +148,6 @@ def add_lags(df, n_lags=3):
 
 # ────────────────────────────────────────────────────────────────
 # 5. Train XGBoost model for one brand
-# Note: returns training X and y so we can compute metrics & explainability
 # ────────────────────────────────────────────────────────────────
 def train_xgboost_brand(product_data, target_col='sales'):
     if len(product_data) < 10:
@@ -188,7 +188,6 @@ def compute_feature_importance(model, feature_names, X_sample=None):
             # Tree explainer for XGBoost
             expl = shap.TreeExplainer(model)
             shap_values = expl.shap_values(X_sample)
-            # shap_values may be 2D (n_samples, n_features)
             mean_abs_shap = np.mean(np.abs(shap_values), axis=0)
             fi_df = pd.DataFrame({
                 'feature': feature_names,
@@ -233,20 +232,95 @@ def append_log_row(filename, row: dict):
         df.to_csv(filename, index=False)
 
 
+# LLM/Groq call helper (generic REST)
+def call_llm_groq(prompt: str, api_key: str, endpoint: str, model: str, max_tokens: int = 1024, timeout: int = 20) -> str:
+    """
+    Generic LLM call helper. The function expects a Bearer-style API key and a JSON REST endpoint.
+    Replace/adapt payload and parsing to match your LLM provider (Groq or vendor-specific).
+    """
+    if not api_key or not endpoint:
+        return None
+
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+
+    payload = {
+        "model": model,
+        "input": prompt,
+        "max_tokens": max_tokens
+    }
+
+    try:
+        resp = requests.post(endpoint, headers=headers, json=payload, timeout=timeout)
+        resp.raise_for_status()
+        data = resp.json()
+        # Generic parsing: try several common shapes
+        if isinstance(data, dict):
+            # Common pattern: {"choices": [{"text": "..."}, ...]} or {"output": "..."} or {"data": {"text": "..."}}
+            if "choices" in data and isinstance(data["choices"], list) and "text" in data["choices"][0]:
+                return data["choices"][0]["text"]
+            if "output" in data and isinstance(data["output"], str):
+                return data["output"]
+            if "text" in data and isinstance(data["text"], str):
+                return data["text"]
+            # Fallback: return pretty JSON string
+            return json.dumps(data, indent=2)
+        else:
+            return str(data)
+    except Exception as e:
+        return f"[LLM call failed: {e}]"
+
+
 # LLM placeholder summary generator (replace with actual LLM call)
-def generate_llm_summary(report: dict) -> str:
+def generate_llm_summary(report: dict, groq_conf: dict = None) -> str:
     """
-    Placeholder: produce a short templated summary for escalation or review.
-    To integrate a real LLM, replace the body with an API call (OpenAI, etc.)
-    and pass 'report' as context / system prompt.
+    If groq_conf provided and valid, call the LLM (Groq) to produce an explanation and recommended actions.
+    Otherwise fall back to the templated summary.
     """
+    if groq_conf and groq_conf.get("api_key") and groq_conf.get("endpoint") and groq_conf.get("model"):
+        # Build a compact prompt combining metrics + KPIs + short table of top features
+        prompt_obj = {
+            "role": "system",
+            "content": "You are a senior supply-chain expert. Produce a clear explanation why the forecasting model produced the outputs, prioritized actions to reduce reverse logistics (returns), estimated return-volume and cost savings, and a short automation rule set. Output must be JSON with keys: explanation, actions (list of {priority, action, rationale}), estimates (estimated_returns_avoided_volume, estimated_reverse_logistics_cost_saving, percent_reduction), automation_rules (list). Keep numbers and assumptions explicit."
+        }
+
+        features_sales = report.get("feature_importance_sales", [])[:6]
+        features_returns = report.get("feature_importance_returns", [])[:6]
+
+        prompt_body = {
+            "brand": report["data_provenance"].get("brand"),
+            "history_months": report["data_provenance"].get("history_months"),
+            "training_start": report["data_provenance"].get("training_start"),
+            "training_end": report["data_provenance"].get("training_end"),
+            "model_metrics": report.get("training_metrics", {}),
+            "top_sales_features": features_sales,
+            "top_returns_features": features_returns,
+            "kpis": report.get("kpis", {}),
+            "notes": report.get("notes", "")
+        }
+
+        full_prompt = prompt_obj["content"] + "\n\n" + json.dumps(prompt_body, indent=2)
+        llm_text = call_llm_groq(full_prompt, groq_conf['api_key'], groq_conf['endpoint'], groq_conf['model'], max_tokens=800)
+        # If LLM returns JSON-like string, try to parse
+        try:
+            parsed = json.loads(llm_text)
+            # Pretty-print if parsed
+            return json.dumps(parsed, indent=2)
+        except Exception:
+            return llm_text
+
+    # Fallback templated summary (existing behavior)
     s = []
     s.append(f"Brand: {report['data_provenance'].get('brand')}")
     s.append(f"Training data: {report['data_provenance'].get('training_start')} to {report['data_provenance'].get('training_end')} ({report['data_provenance'].get('history_months')} months)")
     s.append(f"Sales RMSE (train): {report['training_metrics'].get('sales_rmse')}")
     s.append(f"Returns RMSE (train): {report['training_metrics'].get('returns_rmse')}")
-    s.append("Top sales features: " + ", ".join([f['feature'] for f in report.get('feature_importance_sales', [])[:3]]))
-    s.append("Top returns features: " + ", ".join([f['feature'] for f in report.get('feature_importance_returns', [])[:3]]))
+    top_sales = ", ".join([f['feature'] for f in report.get('feature_importance_sales', [])[:3]])
+    top_returns = ", ".join([f['feature'] for f in report.get('feature_importance_returns', [])[:3]])
+    s.append("Top sales features: " + (top_sales or "N/A"))
+    s.append("Top returns features: " + (top_returns or "N/A"))
     s.append("\nSuggested action: Please review forecasts and safety buffer overrides; consider holding manual stock for high-risk SKUs.")
     return "\n".join(s)
 
@@ -260,9 +334,29 @@ def main():
     st.title("📊 AI Sales Forecasting & Return Reduction Dashboard")
     st.markdown(f"**Current date:** {datetime.now().date()} | Using XGBoost + Shelf-life feature")
 
-    # File uploader
+    # File uploader for sales input
     uploaded_file = st.sidebar.file_uploader("Upload your sales Excel file", type=["xlsx"])
 
+    # --- New: Groq / LLM configuration in sidebar ---
+    st.sidebar.header("LLM / Groq Integration (optional)")
+    groq_key_file = st.sidebar.file_uploader("Upload Groq API key (text file)", type=["txt", "key"])
+    groq_api_key = None
+    if groq_key_file is not None:
+        try:
+            groq_api_key = groq_key_file.read().decode().strip()
+            st.sidebar.success("Groq key loaded (in-memory).")
+        except Exception:
+            st.sidebar.error("Could not read Groq key file. Ensure it's a plain text file with the API key.")
+            groq_api_key = None
+
+    groq_endpoint = st.sidebar.text_input("Groq/LLM endpoint (full URL)", value="")
+    groq_model = st.sidebar.text_input("LLM model name (id)", value="")
+
+    # Reverse logistics cost per unit (used to estimate cost saving)
+    st.sidebar.header("Cost / Savings inputs")
+    reverse_cost_per_unit = st.sidebar.number_input("Estimated reverse logistics cost per unit", min_value=0.0, value=5.0, step=0.1)
+
+    # File required check
     if uploaded_file is None:
         st.info("Please upload your '3 sales.xlsx' file to start.")
         st.stop()
@@ -279,7 +373,7 @@ def main():
     forecast_months = st.sidebar.slider("Forecast next months", 1, 18, 6)
     lag_count = st.sidebar.slider("Number of lags", 1, 6, 3)
 
-    # Human override for buffer multiplier (so humans can test alternative safety margins)
+    # Human override for buffer multiplier
     st.sidebar.header("Human Overrides & Explainability")
     human_buffer_override = st.sidebar.number_input(
         "Safety buffer multiplier (human override)",
@@ -288,7 +382,7 @@ def main():
     )
     show_explain = st.sidebar.checkbox("Show Explainability & Human-AI notes", value=True)
 
-    # New: qualitative event / uplift override (e.g., holiday, promotion)
+    # Qualitative overrides & uplifts
     st.sidebar.header("Qualitative overrides & Simulations")
     event_note = st.sidebar.text_input("Optional event note (e.g., 'Eid promotion')", value="")
     uplift_percent = st.sidebar.number_input("Event uplift on sales (%)", min_value=-100.0, max_value=500.0, value=0.0, step=0.5)
@@ -494,6 +588,22 @@ def main():
         delta_color="normal" if total_reduction < 0 else "inverse"
     )
 
+    # Compute estimated returns avoided and reverse logistics savings using buffer approach
+    total_forecast_returns = df_forecast['Forecast Returns'].sum()
+    # Use human_buffer_override as the buffer assumption to compute potential avoided returns volume
+    buffer_used = float(human_buffer_override) if human_buffer_override is not None else 1.15
+    estimated_returns_avoided_volume = buffer_used * total_forecast_returns
+    estimated_reverse_logistics_cost_saving = estimated_returns_avoided_volume * float(reverse_cost_per_unit)
+    pct_reduction = (estimated_returns_avoided_volume / total_forecast_returns * 100.0) if total_forecast_returns > 0 else 0.0
+
+    st.markdown("### Estimated supply-chain impact (approx)")
+    st.write({
+        "total_forecast_returns_volume": float(total_forecast_returns),
+        "estimated_returns_avoided_volume": float(np.round(estimated_returns_avoided_volume, 2)),
+        "estimated_reverse_logistics_cost_saving": float(np.round(estimated_reverse_logistics_cost_saving, 2)),
+        "percent_reduction_estimate": float(np.round(pct_reduction, 2))
+    })
+
     # Auto-approve logic for low-risk
     auto_approved = False
     if auto_approve_low_risk and train_rmse_sales is not None and train_rmse_sales < rmse_escalation_threshold:
@@ -564,7 +674,12 @@ def main():
                 "feature_importance_sales": compute_feature_importance(model_sales, features_sales, X_sample=X_sales.head(200)).to_dict(orient='records'),
                 "feature_importance_returns": compute_feature_importance(model_returns, features_returns, X_sample=X_returns.head(200)).to_dict(orient='records'),
             }
-            summary = generate_llm_summary(report)
+            groq_conf = {
+                "api_key": groq_api_key,
+                "endpoint": groq_endpoint,
+                "model": groq_model
+            } if groq_api_key else None
+            summary = generate_llm_summary(report, groq_conf)
             append_log_row("escalations_log.csv", {
                 "timestamp": datetime.now().isoformat(),
                 "user": current_user,
@@ -651,10 +766,88 @@ def main():
             },
             "feature_importance_sales": fi_sales[['feature', 'importance', 'method']].to_dict(orient='records'),
             "feature_importance_returns": fi_returns[['feature', 'importance', 'method']].to_dict(orient='records'),
-            "human_buffer_override": float(human_buffer_override)
+            "human_buffer_override": float(human_buffer_override),
+            "kpis": {
+                "total_forecast_returns": float(total_forecast_returns),
+                "estimated_returns_avoided_volume": float(np.round(estimated_returns_avoided_volume, 2)),
+                "estimated_reverse_logistics_cost_saving": float(np.round(estimated_reverse_logistics_cost_saving, 2)),
+                "reverse_cost_per_unit": float(reverse_cost_per_unit)
+            }
         }
         report_text = json.dumps(report, indent=2)
         st.download_button("📥 Download Explainability JSON", report_text, file_name=f"{selected_brand}_explainability_{datetime.now().strftime('%Y%m%d')}.json", mime="application/json")
+
+        # --- New: Request Groq expert recommendations ---
+        st.subheader("LLM-driven supply-chain recommendations (Groq)")
+
+        groq_conf = {
+            "api_key": groq_api_key,
+            "endpoint": groq_endpoint,
+            "model": groq_model
+        } if groq_api_key and groq_endpoint and groq_model else None
+
+        st.markdown("Use the Groq/LLM to produce an expert explanation & prioritized actions. Provide Groq key + endpoint & model in the sidebar to enable.")
+        if st.button("Get Groq Expert Recommendation"):
+            with st.spinner("Generating expert recommendation from LLM..."):
+                # Build report similar to escalation
+                lreport = {
+                    "data_provenance": report["data_provenance"],
+                    "training_metrics": report["training_metrics"],
+                    "feature_importance_sales": report["feature_importance_sales"],
+                    "feature_importance_returns": report["feature_importance_returns"],
+                    "kpis": report["kpis"],
+                    "notes": {
+                        "event_note": event_note,
+                        "uplift_percent": uplift_percent,
+                        "uplift_months": uplift_months,
+                        "returns_spike_pct": returns_spike_pct,
+                        "buffer_used": buffer_used
+                    }
+                }
+                summary = generate_llm_summary(lreport, groq_conf)
+                append_log_row("llm_recommendations_log.csv", {
+                    "timestamp": datetime.now().isoformat(),
+                    "user": current_user,
+                    "brand": selected_brand,
+                    "kpis": json.dumps(lreport.get("kpis", {})),
+                    "llm_output": summary
+                })
+                st.info("LLM recommendation (raw):")
+                st.code(summary)
+
+                # If the LLM returned JSON, display parsed actions in a structured way
+                try:
+                    parsed = json.loads(summary)
+                    if isinstance(parsed, dict):
+                        st.markdown("**LLM Structured Output**")
+                        if "explanation" in parsed:
+                            st.markdown("**Explanation**")
+                            st.write(parsed["explanation"])
+                        if "actions" in parsed:
+                            st.markdown("**Actions (prioritized)**")
+                            for a in parsed["actions"]:
+                                st.write(f"- Priority {a.get('priority', '?')}: {a.get('action')} — {a.get('rationale','')}")
+                        if "estimates" in parsed:
+                            st.markdown("**Estimates**")
+                            st.write(parsed["estimates"])
+                        if "automation_rules" in parsed:
+                            st.markdown("**Suggested automation rules**")
+                            for r in parsed["automation_rules"]:
+                                st.write(f"- {r}")
+                except Exception:
+                    # Not JSON — treat as plain text
+                    pass
+
+                # Show an "Apply suggested automation" button (logs the intent)
+                if st.button("Apply / Log suggested automation (no external effect)"):
+                    append_log_row("automation_log.csv", {
+                        "timestamp": datetime.now().isoformat(),
+                        "user": current_user,
+                        "brand": selected_brand,
+                        "llm_output": summary,
+                        "action_taken": "logged_apply"
+                    })
+                    st.success("Suggested automation logged. (This action is only logged; integrate with your operational systems to enact.)")
 
     # ── Feedback Loop: upload actuals & rate the explanation ───────────
     st.header("Post-decision feedback & retraining")
@@ -747,13 +940,18 @@ def main():
 
     with st.expander("How to connect an LLM for summaries and escalation"):
         st.markdown("""
-        - We provide a templated summary using `generate_llm_summary()` as a placeholder.
-        - Replace that function body with a call to your LLM provider (OpenAI, Anthropic, etc.), passing the 'report' JSON as context.
+        - Provide Groq API key (text file) and fill endpoint + model name in the sidebar.
+        - The app will construct a compact JSON report and ask the LLM (acting as supply-chain expert) for:
+          * explanation of forecast,
+          * prioritized actions to reduce returns,
+          * estimated return-volume avoided and cost savings,
+          * suggested automation rules for decisioning.
         - Example (pseudo):
-          1) load API key from secret store
-          2) call openai.ChatCompletion.create(system=..., user=report_text)
-          3) return text
-        - For sensitive data, ensure encryption in transit & logs, and limit PII in prompts.
+          1) upload key file
+          2) set endpoint (e.g., https://api.groq.ai/v1/llm/predict)
+          3) set model id/name
+          4) click 'Get Groq Expert Recommendation'
+        - For production, move keys to a secure secret store & call LLM from a trusted server or backend.
         """)
 
 if __name__ == "__main__":
